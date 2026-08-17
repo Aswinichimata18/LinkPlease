@@ -193,49 +193,19 @@ async def send_single_dm(dm_id_local: str):
 # ----------------------------------------------------------
 # Background DM Sender Worker — concurrent batch dispatch
 # ----------------------------------------------------------
-def _claim_dm_batch(now: float) -> list:
-    """
-    Atomically fetch and claim a batch of DMs for sending.
-
-    Runs in a thread-pool thread (called via asyncio.to_thread).
-    Marks each selected row status='sending' in the same transaction
-    before returning their IDs, so a concurrent worker process cannot
-    claim the same rows (SQLite WAL serialises writers; only the first
-    commit wins — the second updates 0 rows and gets an empty list).
-    """
-    with SessionLocal() as db:
-        dms = db.query(DM).filter(
-            (DM.status == "queued") |
-            ((DM.status == "failed_retry") & (DM.next_retry_at <= now))
-        ).order_by(DM.updated_at.asc()).limit(DM_CONCURRENCY).all()
-
-        if not dms:
-            return []
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        claimed_ids = []
-        for dm in dms:
-            # Re-check status inside the write transaction — another worker
-            # process may have already claimed this row.
-            if dm.status in ("queued", "failed_retry"):
-                dm.status = "sending"
-                dm.updated_at = now_iso
-                claimed_ids.append(dm.id)
-
-        if claimed_ids:
-            db.commit()
-        return claimed_ids
-
-
 async def send_dms_worker():
     print("DM Sender Worker started.")
     while True:
         try:
             now = time.time()
 
-            # Atomically claim a batch (runs in thread-pool to avoid blocking
-            # the event loop with synchronous SQLAlchemy I/O).
-            dm_ids = await asyncio.to_thread(_claim_dm_batch, now)
+            # Fetch a batch of queued/retryable DMs
+            with SessionLocal() as db:
+                dms = db.query(DM).filter(
+                    (DM.status == "queued") |
+                    ((DM.status == "failed_retry") & (DM.next_retry_at <= now))
+                ).order_by(DM.updated_at.asc()).limit(DM_CONCURRENCY).all()
+                dm_ids = [dm.id for dm in dms]
 
             if not dm_ids:
                 await asyncio.sleep(0.1)
@@ -416,168 +386,12 @@ async def create_rule(rule_in: RuleCreate, db: Session = Depends(get_db)):
     )
 
 
-# ----------------------------------------------------------
-# Synchronous DB helpers — each manages its own session so they
-# can safely run in asyncio.to_thread() without blocking the event loop.
-# ----------------------------------------------------------
-
-def _check_and_insert_event(
-    event_id: str,
-    event_type: str,
-    comment_id,
-    text,
-    user_id,
-    username,
-    created_at,
-    sent_at,
-) -> str:
-    """
-    Deduplicate by event_id and insert a ReceivedEvent row.
-
-    Returns:
-        "duplicate"  — event already exists, caller should return 200 early.
-        "inserted"   — new event was recorded.
-    """
-    with SessionLocal() as db:
-        existing = db.query(ReceivedEvent).filter(
-            ReceivedEvent.event_id == event_id
-        ).first()
-        if existing:
-            return "duplicate"
-
-        db_event = ReceivedEvent(
-            event_id=event_id,
-            event_type=event_type,
-            comment_id=comment_id,
-            text=text,
-            user_id=user_id,
-            username=username,
-            created_at=created_at,
-            sent_at=sent_at,
-            received_at=datetime.now(timezone.utc).isoformat(),
-        )
-        db.add(db_event)
-        try:
-            db.commit()
-            return "inserted"
-        except IntegrityError:
-            db.rollback()
-            return "duplicate"
-
-
-def _handle_comment_deleted(comment_id: str) -> None:
-    """Record a deleted comment and suppress any in-flight DMs for it."""
-    with SessionLocal() as db:
-        db_del = DeletedComment(
-            comment_id=comment_id,
-            deleted_at=datetime.now(timezone.utc).isoformat(),
-        )
-        db.add(db_del)
-
-        # Suppress any queued/retrying/sending DMs for this comment
-        db.query(DM).filter(
-            (DM.comment_id == comment_id)
-            & (DM.status.in_(["queued", "failed_retry", "sending"]))
-        ).update(
-            {"status": "suppressed", "error_detail": "Comment deleted event received"},
-            synchronize_session=False,
-        )
-
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-
-
-def _handle_comment_created(
-    comment_id: str,
-    text: str,
-    user_id: str,
-    username,
-    created_at,
-) -> str:
-    """
-    Match rules against the comment text and queue DMs.
-
-    Returns:
-        "suppressed" — comment was already deleted before this event arrived.
-        "processed"  — rule matching ran (zero or more DMs queued).
-    """
-    with SessionLocal() as db:
-        # Out-of-order deletion check
-        deleted_record = db.query(DeletedComment).filter(
-            DeletedComment.comment_id == comment_id
-        ).first()
-        if deleted_record:
-            return "suppressed"
-
-        # Case-insensitive substring keyword matching
-        rules = db.query(Rule).all()
-        comment_text_lower = text.lower()
-        matched_rules = [r for r in rules if r.keyword.lower() in comment_text_lower]
-
-        for rule in matched_rules:
-            # Per-(user, rule) deduplication
-            existing_dm = db.query(DM).filter(
-                (DM.recipient_user_id == user_id) & (DM.rule_id == rule.id)
-            ).first()
-
-            if existing_dm:
-                db_dup = BlockedDuplicate(
-                    comment_id=comment_id,
-                    rule_id=rule.id,
-                    user_id=user_id,
-                    blocked_at=time.time(),
-                )
-                db.add(db_dup)
-                try:
-                    db.commit()
-                except IntegrityError:
-                    db.rollback()
-                continue
-
-            # Queue a new DM
-            dm_id = str(uuid.uuid4())
-            new_dm = DM(
-                id=dm_id,
-                recipient_user_id=user_id,
-                comment_id=comment_id,
-                rule_id=rule.id,
-                status="queued",
-                message=rule.dm_message,
-                idempotency_key=str(uuid.uuid4()),
-                updated_at=datetime.now(timezone.utc).isoformat(),
-            )
-            db.add(new_dm)
-            try:
-                db.commit()
-            except IntegrityError:
-                db.rollback()
-                # Concurrent duplicate — record as blocked
-                db_dup = BlockedDuplicate(
-                    comment_id=comment_id,
-                    rule_id=rule.id,
-                    user_id=user_id,
-                    blocked_at=time.time(),
-                )
-                db.add(db_dup)
-                try:
-                    db.commit()
-                except IntegrityError:
-                    db.rollback()
-                print(f"Concurrent duplicate blocked for user {user_id} rule {rule.id}")
-
-        return "processed"
-
-
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, db: Session = Depends(get_db)):
     """
     Receive Pseudogram webhook events.
     Must return HTTP 200 within 5 seconds — no heavy work happens here.
-    All DB I/O is offloaded to the thread-pool via asyncio.to_thread() so
-    synchronous SQLAlchemy calls never block the event loop.  All DM
-    sending is handled by the background workers started in lifespan().
+    All DM sending is offloaded to background workers.
     """
     body_bytes = await request.body()
     signature_header = request.headers.get("X-PseudoGram-Signature")
@@ -602,6 +416,11 @@ async def webhook(request: Request):
     if not event_id or not event_type:
         return JSONResponse(status_code=400, content={"error": "Missing event_id or event_type"})
 
+    # Event deduplication — enforce uniqueness of event_id
+    existing_event = db.query(ReceivedEvent).filter(ReceivedEvent.event_id == event_id).first()
+    if existing_event:
+        return {"ok": True, "detail": "duplicate event ignored"}
+
     # Parse comment fields
     comment_id = data.get("comment_id")
     text = data.get("text")
@@ -610,31 +429,120 @@ async def webhook(request: Request):
     username = from_user.get("username")
     created_at = data.get("created_at")
 
-    # --- Deduplication + event recording (offloaded to thread-pool) ---
-    insert_result = await asyncio.to_thread(
-        _check_and_insert_event,
-        event_id, event_type, comment_id, text,
-        user_id, username, created_at, sent_at,
+    db_event = ReceivedEvent(
+        event_id=event_id,
+        event_type=event_type,
+        comment_id=comment_id,
+        text=text,
+        user_id=user_id,
+        username=username,
+        created_at=created_at,
+        sent_at=sent_at,
+        received_at=datetime.now(timezone.utc).isoformat()
     )
-    if insert_result == "duplicate":
-        return {"ok": True, "detail": "duplicate event ignored"}
+    db.add(db_event)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return {"ok": True, "detail": "duplicate event ignored concurrently"}
 
-    # --- Event-type dispatch (all DB work offloaded to thread-pool) ---
+    # Handle comment.deleted
     if event_type == "comment.deleted":
         if not comment_id:
             return JSONResponse(status_code=400, content={"error": "Missing comment_id"})
-        await asyncio.to_thread(_handle_comment_deleted, comment_id)
+
+        db_del = DeletedComment(
+            comment_id=comment_id,
+            deleted_at=datetime.now(timezone.utc).isoformat()
+        )
+        db.add(db_del)
+
+        # Suppress any queued/retrying DMs for this comment
+        db.query(DM).filter(
+            (DM.comment_id == comment_id) &
+            (DM.status.in_(["queued", "failed_retry", "sending"]))
+        ).update(
+            {"status": "suppressed", "error_detail": "Comment deleted event received"},
+            synchronize_session=False
+        )
+
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+
         return {"ok": True, "detail": "deletion recorded"}
 
+    # Handle comment.created
     if event_type == "comment.created":
         if not comment_id or not text or not user_id:
             return JSONResponse(status_code=400, content={"error": "Malformed comment.created payload"})
-        result = await asyncio.to_thread(
-            _handle_comment_created,
-            comment_id, text, user_id, username, created_at,
-        )
-        if result == "suppressed":
+
+        # Out-of-order deletion check: comment was deleted before created event arrived
+        deleted_record = db.query(DeletedComment).filter(
+            DeletedComment.comment_id == comment_id
+        ).first()
+        if deleted_record:
             return {"ok": True, "detail": "comment already deleted, suppressed DM creation"}
+
+        # Case-insensitive substring keyword matching
+        rules = db.query(Rule).all()
+        comment_text_lower = text.lower()
+        matched_rules = [r for r in rules if r.keyword.lower() in comment_text_lower]
+
+        for rule in matched_rules:
+            # Per-(user, rule) deduplication
+            existing_dm = db.query(DM).filter(
+                (DM.recipient_user_id == user_id) &
+                (DM.rule_id == rule.id)
+            ).first()
+
+            if existing_dm:
+                # Record blocked duplicate
+                db_dup = BlockedDuplicate(
+                    comment_id=comment_id,
+                    rule_id=rule.id,
+                    user_id=user_id,
+                    blocked_at=time.time()
+                )
+                db.add(db_dup)
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                continue
+
+            # Queue a new DM
+            dm_id = str(uuid.uuid4())
+            new_dm = DM(
+                id=dm_id,
+                recipient_user_id=user_id,
+                comment_id=comment_id,
+                rule_id=rule.id,
+                status="queued",
+                message=rule.dm_message,
+                idempotency_key=str(uuid.uuid4()),
+                updated_at=datetime.now(timezone.utc).isoformat()
+            )
+            db.add(new_dm)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                # Concurrent duplicate — record as blocked
+                db_dup = BlockedDuplicate(
+                    comment_id=comment_id,
+                    rule_id=rule.id,
+                    user_id=user_id,
+                    blocked_at=time.time()
+                )
+                db.add(db_dup)
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                print(f"Concurrent duplicate blocked for user {user_id} rule {rule.id}")
 
     return {"ok": True}
 
