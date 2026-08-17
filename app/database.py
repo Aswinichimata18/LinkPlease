@@ -1,9 +1,10 @@
 import os
-import time
 from sqlalchemy import create_engine, Column, String, Integer, Float, ForeignKey, UniqueConstraint, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./linkplease.db")
+# On Render, use the persistent disk at /data. Locally fall back to ./linkplease.db
+_default_db = "sqlite:////data/linkplease.db" if os.getenv("RENDER") else "sqlite:///./linkplease.db"
+DATABASE_URL = os.getenv("DATABASE_URL", _default_db)
 
 connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
@@ -68,10 +69,6 @@ class DM(Base):
         UniqueConstraint('recipient_user_id', 'rule_id', name='uq_recipient_rule'),
     )
 
-class RateLimitLog(Base):
-    __tablename__ = "rate_limit_log"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(Float, index=True, nullable=False)
 
 class BlockedDuplicate(Base):
     __tablename__ = "blocked_duplicates"
